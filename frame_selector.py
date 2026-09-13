@@ -852,6 +852,7 @@ class InteractiveFrameSelector:
             )
             selection_revision = int((_read_project_state(project_name) or {}).get("revision", 0))
             _save_selection_anchor(project_name, selected_image, selection_revision)
+            _save_project_start_frame(project_name, selected_image, selection_revision)
             if latent_segment is not None:
                 from .h3_latent_tools import commit_accepted_segment
                 commit_accepted_segment(latent_segment, project_name)
@@ -914,6 +915,7 @@ class InteractiveFrameSelector:
             )
             selection_revision = int((_read_project_state(project_name) or {}).get("revision", 0))
             _save_selection_anchor(project_name, selected_image, selection_revision)
+            _save_project_start_frame(project_name, selected_image, selection_revision)
             if latent_segment is not None:
                 from .h3_latent_tools import commit_accepted_segment
                 commit_accepted_segment(latent_segment, project_name)
@@ -1502,6 +1504,77 @@ def _start_frame_files(project_name):
     return sorted(numbered, key=lambda item: item[0])
 
 
+def _save_project_start_frame(project_name, image, selection_revision):
+    """Save exactly one queue frame for an accepted selector revision."""
+    from PIL import Image
+
+    state = _read_project_state(project_name) or {}
+    latest = state.get("latest_selection", {})
+    if int(latest.get("selection_revision", -1)) != int(selection_revision):
+        return None
+    number = max(1, len(state.get("accepted_clips", [])))
+    folder = _start_frames_directory(project_name, create=True)
+    filename = f"frame_{number:06d}.png"
+    path = folder / filename
+    with _start_frames_lock:
+        temporary = folder / f"frame_{number:06d}_{uuid.uuid4().hex}.tmp.png"
+        rgb = np.clip(image[0, ..., :3].detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+        Image.fromarray(rgb, mode="RGB").save(temporary, format="PNG")
+        os.replace(temporary, path)
+    with _project_state_lock:
+        current = _read_project_state(project_name)
+        current_latest = (current or {}).get("latest_selection", {})
+        if current and int(current_latest.get("selection_revision", -1)) == int(selection_revision):
+            current_latest["start_frame_file"] = str(
+                path.resolve().relative_to(_project_state_path(project_name, True).parent.resolve())
+            )
+            _write_project_state(project_name, current)
+    print(f"[Interactive Frame Selector] Saved project start frame: {path}")
+    return path
+
+
+def _repair_latest_project_start_frame(project_name):
+    """Recover a missing queue entry from the selector's committed anchor."""
+    state = _read_project_state(project_name) or {}
+    latest = state.get("latest_selection", {})
+    if latest.get("decision") != "accepted":
+        return None
+    number = len(state.get("accepted_clips", []))
+    if number < 1:
+        return None
+    folder = _start_frames_directory(project_name, create=True)
+    target = folder / f"frame_{number:06d}.png"
+    if target.is_file():
+        return target
+    relative = str(latest.get("anchor_image_file") or "")
+    if not relative:
+        return None
+    project_root = _project_state_path(project_name, True).parent.resolve()
+    source = (project_root / relative.replace("\\", os.sep)).resolve()
+    try:
+        source.relative_to(project_root)
+    except ValueError:
+        return None
+    if not source.is_file():
+        return None
+    with _start_frames_lock:
+        if not target.is_file():
+            temporary = folder / f"frame_{number:06d}_{uuid.uuid4().hex}.tmp.png"
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, target)
+    with _project_state_lock:
+        current = _read_project_state(project_name)
+        if current and int(current.get("latest_selection", {}).get("selection_revision", -1)) == int(
+            latest.get("selection_revision", -2)
+        ):
+            current["latest_selection"]["start_frame_file"] = str(
+                target.resolve().relative_to(project_root)
+            )
+            _write_project_state(project_name, current)
+    print(f"[Load Project Start Frame] Repaired missing accepted queue frame: {target}")
+    return target
+
+
 def _pil_to_image_and_mask(path):
     from PIL import Image, ImageOps
 
@@ -1555,6 +1628,24 @@ class SaveProjectStartFrame:
     def save(self, image, project_name="My Project"):
         from PIL import Image
 
+        state = _read_project_state(project_name) or {}
+        recorded = str(state.get("latest_selection", {}).get("start_frame_file") or "")
+        if recorded:
+            project_root = _project_state_path(project_name, True).parent.resolve()
+            existing_path = (project_root / recorded.replace("\\", os.sep)).resolve()
+            try:
+                existing_path.relative_to(project_root)
+            except ValueError:
+                existing_path = None
+            if existing_path is not None and existing_path.is_file():
+                project = _clean_project_name(project_name)
+                subfolder = f"frame_selector_projects/{project}/start_frames"
+                print(
+                    "[Save Project Start Frame] Selector already saved this accepted revision; "
+                    f"using: {existing_path}"
+                )
+                return {"ui": {"images": [{"filename": existing_path.name, "subfolder": subfolder, "type": "output"}]}, "result": ()}
+
         with _start_frames_lock:
             existing = _start_frame_files(project_name)
             number = (existing[-1][0] + 1) if existing else 1
@@ -1603,6 +1694,7 @@ class LoadProjectStartFrame:
 
     def load(self, source_mode, initial_image, project_name="My Project", frame_index=-1):
         if source_mode == "project_queue":
+            _repair_latest_project_start_frame(project_name)
             with _start_frames_lock:
                 files = _start_frame_files(project_name)
                 if files:
