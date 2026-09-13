@@ -1,4 +1,5 @@
 import hashlib
+import io
 import importlib
 import json
 import math
@@ -223,16 +224,26 @@ def _extract_frame(source, index):
         frame = source["frames"][index:index + 1]
         return frame[..., :3].detach().cpu().float()
 
-    cv2, cap = _open_video(source["path"])
-    try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, bgr = cap.read()
-        if not ok:
-            raise RuntimeError(f"Could not decode frame {index}.")
-    finally:
-        cap.release()
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return torch.from_numpy(rgb.astype(np.float32) / 255.0).unsqueeze(0)
+    # OpenCV commonly decodes HD YUV video with a BT.601 matrix even when the
+    # stream is tagged BT.709. That made selected/start PNGs several RGB levels
+    # darker than the exact same frame in the accepted MP4, producing a sudden
+    # colour shift at the next join. FFmpeg respects the stream's colour tags
+    # and matches both the browser preview and our cut encoder.
+    command = [
+        _find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+        "-i", source["path"],
+        "-vf", f"select=eq(n\\,{index})",
+        "-vsync", "0", "-frames:v", "1",
+        "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+    ]
+    completed = subprocess.run(command, capture_output=True)
+    if completed.returncode != 0 or not completed.stdout:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Could not decode frame {index} with FFmpeg: {detail}")
+    from PIL import Image
+    with Image.open(io.BytesIO(completed.stdout)) as image:
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(rgb.copy()).unsqueeze(0)
 
 
 def _clean_project_name(value):
@@ -1395,10 +1406,11 @@ class ProjectAudioStartTime:
         # directly onto a later composition. Keep those 12 frames at the end
         # as disposable H3-grid overhead instead.
         prefix_frames = handover_frames
-        chain = _generation_plan_path(project_name).parent
-        has_context = bool(state.get("accepted_clips")) and any(
-            (chain / filename).is_file() for filename in ("latest_segment.pt", "assembled.pt")
-        )
+        # Accepted clips are the durable continuation authority. The Builder
+        # can reconstruct an exact 39f RGB/VAE handover if a crash, reroll, or
+        # older pack version lost the optional latent cache. Do not silently
+        # emit a first-run/direct plan merely because those .pt files vanished.
+        has_context = bool(state.get("accepted_clips"))
         if has_context and desired_start >= prefix_frames / float(PROJECT_TIMELINE_FPS):
             # The current VDN Comfy acceleration path aborts at the short
             # continuation layouts T42/F42 (141f) and T47/F47 (158f), even
@@ -1528,13 +1540,14 @@ def _save_project_start_frame(project_name, image, selection_revision):
             current_latest["start_frame_file"] = str(
                 path.resolve().relative_to(_project_state_path(project_name, True).parent.resolve())
             )
+            current_latest["color_decode_version"] = 2
             _write_project_state(project_name, current)
     print(f"[Interactive Frame Selector] Saved project start frame: {path}")
     return path
 
 
 def _repair_latest_project_start_frame(project_name):
-    """Recover a missing queue entry from the selector's committed anchor."""
+    """Recover or colour-correct the latest accepted project queue frame."""
     state = _read_project_state(project_name) or {}
     latest = state.get("latest_selection", {})
     if latest.get("decision") != "accepted":
@@ -1544,8 +1557,36 @@ def _repair_latest_project_start_frame(project_name):
         return None
     folder = _start_frames_directory(project_name, create=True)
     target = folder / f"frame_{number:06d}.png"
-    if target.is_file():
+    if target.is_file() and int(latest.get("color_decode_version", 0)) >= 2:
         return target
+    # Migrate pre-v63 anchors through FFmpeg's metadata-aware decoder. Those
+    # PNGs were previously produced by OpenCV, which used the wrong YUV matrix
+    # for BT.709 files and made the next generation visibly change colour.
+    clips = list(state.get("accepted_clips", []))
+    if clips:
+        record = clips[-1]
+        relative_cut = str(record.get("file") or "")
+        project_root = _project_state_path(project_name, True).parent.resolve()
+        cut_path = (project_root / relative_cut.replace("\\", os.sep)).resolve()
+        try:
+            cut_path.relative_to(project_root)
+        except ValueError:
+            cut_path = None
+        frame_count = max(1, int(record.get("saved_frame_count", 1)))
+        if cut_path is not None and cut_path.is_file():
+            corrected = _extract_frame(
+                {"kind": "file", "path": str(cut_path), "count": frame_count},
+                frame_count - 1,
+            )
+            revision = int(latest.get("selection_revision", -1))
+            _save_selection_anchor(project_name, corrected, revision)
+            repaired = _save_project_start_frame(project_name, corrected, revision)
+            if repaired is not None:
+                print(
+                    "[Load Project Start Frame] Migrated accepted endpoint to "
+                    f"metadata-correct RGB: {repaired}"
+                )
+                return repaired
     relative = str(latest.get("anchor_image_file") or "")
     if not relative:
         return None

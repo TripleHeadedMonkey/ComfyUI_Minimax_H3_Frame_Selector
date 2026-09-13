@@ -7,6 +7,7 @@ upscaling VAEs (including custom 2x decoders) remain compatible.
 
 import json
 import os
+import subprocess
 import threading
 import uuid
 from datetime import datetime
@@ -226,14 +227,14 @@ def _read_project_selection(project_name):
     return selection if isinstance(selection, dict) and selection.get("decision") == "accepted" else None
 
 
-def _exact_video_context(project_name, selection, vae, target_video, context_frames):
+def _exact_video_context(project_name, selection, vae, target_video, context_frames, force=False):
     """Re-encode an off-grid accepted endpoint from its exact saved RGB tail."""
     revision = int((selection or {}).get("selection_revision", -1))
     residual = int((selection or {}).get("residual_decoded_frames", 0))
     # Project 043's initial 1f residual produced a perfect first extension;
     # preserve that fast path. Larger residuals visibly desynchronise the next
     # latent tail from the accepted RGB endpoint and require exact re-encoding.
-    if revision < 0 or residual <= 1:
+    if revision < 0 or (residual <= 1 and not force):
         return None
 
     folder = _chain_directory(project_name, create=True)
@@ -247,6 +248,7 @@ def _exact_video_context(project_name, selection, vae, target_video, context_fra
             video = cached.get("video") if isinstance(cached, dict) else None
             if (
                 int(cached.get("selection_revision", -2)) == revision
+                and int(cached.get("color_decode_version", 0)) == 2
                 and torch.is_tensor(video)
                 and _frames_from_video_t(video.shape[2]) == int(context_frames)
                 and tuple(video.shape[-2:]) == tuple(target_video.shape[-2:])
@@ -283,18 +285,31 @@ def _exact_video_context(project_name, selection, vae, target_video, context_fra
         if count < int(context_frames):
             capture.release()
             return None
-        capture.set(cv2.CAP_PROP_POS_FRAMES, count - int(context_frames))
-        frames = []
-        try:
-            for _ in range(int(context_frames)):
-                ok, frame = capture.read()
-                if not ok:
-                    return None
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        finally:
-            capture.release()
-
-        pixels = torch.from_numpy(np.stack(frames)).to(dtype=torch.float32).div_(255.0)
+        width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        capture.release()
+        if width < 1 or height < 1:
+            return None
+        start = count - int(context_frames)
+        from .frame_selector import _find_ffmpeg
+        command = [
+            _find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+            "-i", str(cut_path),
+            "-vf", f"select=gte(n\\,{start})",
+            "-vsync", "0", "-frames:v", str(int(context_frames)),
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ]
+        completed = subprocess.run(command, capture_output=True)
+        expected_bytes = int(context_frames) * height * width * 3
+        if completed.returncode != 0 or len(completed.stdout) != expected_bytes:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"FFmpeg returned {len(completed.stdout)} RGB bytes, expected {expected_bytes}: {detail}"
+            )
+        frames = np.frombuffer(completed.stdout, dtype=np.uint8).reshape(
+            int(context_frames), height, width, 3
+        ).copy()
+        pixels = torch.from_numpy(frames).to(dtype=torch.float32).div_(255.0)
         height = int(target_video.shape[-2]) * 16
         width = int(target_video.shape[-1]) * 16
         pixels = comfy.utils.common_upscale(
@@ -316,6 +331,7 @@ def _exact_video_context(project_name, selection, vae, target_video, context_fra
         encoded = encoded.detach().cpu()
         _atomic_torch_save(cache_path, {
             "selection_revision": revision,
+            "color_decode_version": 2,
             "context_frames": int(context_frames),
             "video": encoded,
         })
@@ -469,62 +485,104 @@ class MiniMaxH3ContinuationBuilder:
         else:
             saved = _load_saved_context(project_name)
             if saved is None:
+                selection = _read_project_selection(project_name)
                 first_plan = _read_generation_plan(project_name)
-                first_output_frames = int(
-                    (first_plan or {}).get("requested_output_frames_24fps", target_frames)
+                planned_handover = int(
+                    (first_plan or {}).get("latent_handover_frames_24fps", 0)
                 )
-                _write_active_generation_context(
-                    project_name,
-                    0,
-                    handover_frames=0,
-                    requested_output_frames=first_output_frames,
-                )
-                print(
-                    "[MiniMax H3 Continuation Builder] No accepted project latent exists yet; "
-                    "first run passes the target latent through unchanged."
-                )
-                return (positive, target_latent, 0, 0.0, -1, False)
-            selection = _read_project_selection(project_name)
-            manifest = _read_chain_manifest(project_name)
-            selected_revision = int((selection or {}).get("selection_revision", -1))
-            committed_revision = int((manifest or {}).get("selection_revision", -2))
-            if selected_revision < 0 or committed_revision != selected_revision:
+                # Accepted video is durable project history even if a crash,
+                # interrupted reroll, or older node version lost the optional
+                # latent cache. Rebuild the exact visual handover from the last
+                # accepted cut rather than silently treating an established
+                # project as a fresh first run.
+                if selection is not None and planned_handover > 0:
+                    recovery_frames = _resolve_handover(
+                        planned_handover, min(target_frames, planned_handover)
+                    )
+                    recovered_video = _exact_video_context(
+                        project_name,
+                        selection,
+                        video_vae,
+                        target_video,
+                        recovery_frames,
+                        force=True,
+                    )
+                    if recovered_video is None:
+                        raise RuntimeError(
+                            "Accepted project history exists but its latent cache is missing, "
+                            "and the exact RGB tail could not be reconstructed from the last "
+                            "accepted cut. The continuation was stopped to avoid generating an "
+                            "unrelated direct clip."
+                        )
+                    source_video = recovered_video
+                    source_audio = target_audio
+                    source_frames = recovery_frames
+                    print(
+                        "[MiniMax H3 Continuation Builder] Recovered missing latent handover "
+                        f"from accepted project video ({recovery_frames}f)."
+                    )
+                else:
+                    first_output_frames = int(
+                        (first_plan or {}).get("requested_output_frames_24fps", target_frames)
+                    )
+                    _write_active_generation_context(
+                        project_name,
+                        0,
+                        handover_frames=0,
+                        requested_output_frames=first_output_frames,
+                    )
+                    print(
+                        "[MiniMax H3 Continuation Builder] No accepted project latent exists yet; "
+                        "first run passes the target latent through unchanged."
+                    )
+                    return (positive, target_latent, 0, 0.0, -1, False)
+            else:
+                selection = _read_project_selection(project_name)
+                manifest = _read_chain_manifest(project_name)
+                selected_revision = int((selection or {}).get("selection_revision", -1))
+                committed_revision = int((manifest or {}).get("selection_revision", -2))
+                if selected_revision < 0 or committed_revision != selected_revision:
                 # Older workflows allowed the output node to race ahead of the
                 # interactive selector.  In that case the missing accepted
                 # latent cannot be reconstructed from the encoded MP4.  Drop
                 # only the stale latent cache and allow one image-guided fresh
                 # segment to reseed it; accepted clips and project state stay.
-                folder = _chain_directory(project_name)
-                for filename in (
-                    "assembled.pt", "latest_segment.pt", "exact_video_context.pt",
-                    "chain.json", "active_generation.json"
-                ):
-                    try:
-                        (folder / filename).unlink()
-                    except FileNotFoundError:
-                        pass
-                recovery_plan = _read_generation_plan(project_name) or {}
-                _write_active_generation_context(
-                    project_name,
-                    int(recovery_plan.get("cut_prefix_frames_24fps", 0)),
-                    handover_frames=0,
-                    requested_output_frames=int(
-                        recovery_plan.get(
-                            "requested_output_frames_24fps", target_frames
+                    folder = _chain_directory(project_name)
+                    for filename in (
+                        "assembled.pt", "latest_segment.pt", "exact_video_context.pt",
+                        "chain.json", "active_generation.json"
+                    ):
+                        try:
+                            (folder / filename).unlink()
+                        except FileNotFoundError:
+                            pass
+                    recovery_plan = _read_generation_plan(project_name) or {}
+                    recovery_frames = int(recovery_plan.get("latent_handover_frames_24fps", 0))
+                    recovered_video = _exact_video_context(
+                        project_name,
+                        selection,
+                        video_vae,
+                        target_video,
+                        recovery_frames,
+                        force=True,
+                    ) if recovery_frames > 0 else None
+                    if recovered_video is None:
+                        raise RuntimeError(
+                            "The accepted project selection and latent cache revisions differ, "
+                            "and the exact visual tail could not be recovered. Continuation was "
+                            "stopped instead of generating a direct replacement clip."
                         )
-                    ),
-                )
-                print(
-                    "[MiniMax H3 Continuation Builder] WARNING: stale latent cache detected "
-                    f"(project selection revision {selected_revision}, latent revision "
-                    f"{committed_revision}). Cleared latent cache and using one image-guided "
-                    "fresh segment to reseed it. Connect the selector's selected_frame output "
-                    "to Latent Chain's selector_commit_signal input."
-                )
-                return (positive, target_latent, 0, 0.0, -1, False)
-            source_video = saved["video"]
-            source_audio = saved["audio"]
-            source_frames = _frames_from_video_t(source_video.shape[2])
+                    source_video = recovered_video
+                    source_audio = target_audio
+                    source_frames = recovery_frames
+                    print(
+                        "[MiniMax H3 Continuation Builder] Recovered stale latent handover "
+                        f"from accepted project video (selection revision {selected_revision})."
+                    )
+                else:
+                    source_video = saved["video"]
+                    source_audio = saved["audio"]
+                    source_frames = _frames_from_video_t(source_video.shape[2])
 
         if tuple(source_video.shape[-2:]) != tuple(target_video.shape[-2:]):
             raise ValueError(

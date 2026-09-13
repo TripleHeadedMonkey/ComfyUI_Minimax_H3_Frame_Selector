@@ -105,7 +105,7 @@ Two nodes under **image → project** provide the image handoff between complete
 - **Load Project Start Frame** has the same upload/dropdown behavior as a normal image loader plus a two-way `source_mode` toggle. `standard_upload` uses the manually selected image. `project_queue` uses the separate `frame_index` value to select a chronological PNG from `project_name`: index `0` is the oldest, `1` is the second, and `-1` is the newest. Out-of-range indices clamp to the nearest end. If the project folder is empty, it falls back to the uploaded image. It returns `IMAGE` plus `MASK`.
 - **Save Project Start Frame** remains available as a compatibility/manual output node. Interactive Frame Selector now saves the accepted start frame transactionally itself as `frame_000001.png`, `frame_000002.png`, and so on inside `ComfyUI/output/frame_selector_projects/<project>/start_frames/`. If the Save node is still connected, it detects that revision and does not create a duplicate.
 
-The default `frame_index` is `-1`, so normal repeated runs always use the newest saved frame. After a discard, the newest frame is unchanged and is therefore reused automatically. Changing the index lets you scroll through earlier scenes without any third mode or cursor state. Give the related nodes exactly the same `project_name`. On loading an older project whose queue entry was missed by a downstream Save node, Load Project Start Frame repairs it from the selector's committed selection image.
+The default `frame_index` is `-1`, so normal repeated runs always use the newest saved frame. After a discard, the newest frame is unchanged and is therefore reused automatically. Changing the index lets you scroll through earlier scenes without any third mode or cursor state. Give the related nodes exactly the same `project_name`. On loading an older project whose queue entry was missed by a downstream Save node, Load Project Start Frame repairs it from the selector's committed selection image. Pre-v63 endpoints are also migrated once from the accepted MP4 using FFmpeg's metadata-aware RGB conversion, avoiding the BT.601/BT.709 colour shift that OpenCV decoding could introduce.
 
 Frame numbering is zero-based: the first frame is frame `0`. Time input accepts seconds, `MM:SS.mmm`, or `HH:MM:SS.mmm`. The chosen frame number is authoritative.
 
@@ -170,6 +170,8 @@ After selection, the node reads `project_state.json` automatically and truncates
 - The Builder never reuses the chain's generated audio. For music workflows, continue using the original song and the existing project audio-offset path as the authoritative audio source.
 
 For the normal interactive workflow, the standalone Latent Chain node is no longer required. Connect the sampler output directly to Interactive Frame Selector's optional `latent_segment`. Pressing **Select This Frame** commits the latent synchronously; **Discard Generation**, Cancel, or a crash commits nothing. The standalone node remains available for non-interactive/manual chain workflows.
+
+Accepted MP4 cuts and selector images remain authoritative if an older run, crash, or interrupted reroll leaves the optional `.pt` latent cache missing or stale. Project Audio Start Time continues to plan the overlap, and Continuation Builder re-encodes the final accepted 39-frame RGB tail with the connected video VAE. If that recovery cannot be completed, execution stops with an error instead of silently producing a fresh direct clip with a different composition or colour grade.
 
 Reusable interactive loop wiring:
 
