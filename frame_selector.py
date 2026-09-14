@@ -526,10 +526,17 @@ def _active_generation_cut_frames(project_name, source_fps, frame_count):
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return 0, 0, int(frame_count)
     maximum = max(0, int(frame_count) - 1)
+    audio = max(0, min(int(round(audio_24 * float(source_fps) / PROJECT_TIMELINE_FPS)), maximum))
     video = max(0, min(int(round(video_24 * float(source_fps) / PROJECT_TIMELINE_FPS)), maximum))
-    # The expanded Builder places the complete fresh target after an equally
-    # long disposable joint pre-roll, so both streams use the same cut point.
-    audio = video
+    # For an off-grid endpoint the Builder anchors the selected image on the
+    # first saveable frame. The previous accepted clip already contains that
+    # exact endpoint, so retaining it again creates a one-frame join stutter.
+    # Drop that duplicate picture only; keep audio at the original handover so
+    # the guidance track remains sample-continuous.
+    project_state = _read_project_state(project_name) or {}
+    residual = int(project_state.get("latest_selection", {}).get("residual_decoded_frames", 0))
+    if video > 0 and residual > 1:
+        video = min(maximum, video + max(1, int(round(float(source_fps) / PROJECT_TIMELINE_FPS))))
     if requested_24 > 0:
         requested_source = max(
             1, int(round(requested_24 * float(source_fps) / PROJECT_TIMELINE_FPS))
@@ -633,7 +640,7 @@ def _record_accepted_cut(
         )
         # `selected` is an inclusive frame index. Keep project/audio advancement
         # identical to the frame count written by _save_cut (end_frame=selected+1).
-        accepted_source_frames = int(selected) - start_frame + 1
+        accepted_source_frames = int(selected) - video_start_frame + 1
         advance_frames = max(
             0,
             int(round(accepted_source_frames * PROJECT_TIMELINE_FPS / float(source_fps))),
@@ -666,7 +673,7 @@ def _record_accepted_cut(
             "selected_frame": int(selected),
             "saved_start_frame": video_start_frame,
             "audio_start_frame": start_frame,
-            "saved_frame_count": int(selected) - start_frame + 1,
+            "saved_frame_count": int(selected) - video_start_frame + 1,
             "source_fps": float(source_fps),
             "timeline_start_frame": previous_frames,
             "timeline_end_frame": next_frames,
@@ -859,7 +866,7 @@ class InteractiveFrameSelector:
                 source, selected, project_name, video_start_frame, audio_start_frame, guidance_audio
             )
             previous_audio, next_audio = _record_accepted_cut(
-                project_name, saved, selected, source["fps"], video_start_frame, video_start_frame
+                project_name, saved, selected, source["fps"], audio_start_frame, video_start_frame
             )
             selection_revision = int((_read_project_state(project_name) or {}).get("revision", 0))
             _save_selection_anchor(project_name, selected_image, selection_revision)
@@ -922,7 +929,7 @@ class InteractiveFrameSelector:
                 source, selected, project_name, video_start_frame, audio_start_frame, guidance_audio
             )
             previous_audio, next_audio = _record_accepted_cut(
-                project_name, saved, selected, source["fps"], video_start_frame, video_start_frame
+                project_name, saved, selected, source["fps"], audio_start_frame, video_start_frame
             )
             selection_revision = int((_read_project_state(project_name) or {}).get("revision", 0))
             _save_selection_anchor(project_name, selected_image, selection_revision)
